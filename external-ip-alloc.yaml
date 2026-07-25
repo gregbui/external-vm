@@ -1,0 +1,82 @@
+---
+# ──────────────────────────────────────────────
+# External IP Allocation via External Secrets
+# ──────────────────────────────────────────────
+# This ExternalSecret reads the next available IP from an
+# external IPAM (Infoblox, Kea, custom API, etc.) and
+# stores it in a Kubernetes Secret for the composition to use.
+#
+# Prerequisites:
+#   1. External Secrets Operator installed
+#   2. A SecretStore/ClusterSecretStore pointing to your IPAM
+#   3. The IPAM API returns JSON like: {"ip": "10.20.30.100"}
+#
+# Usage:
+#   kubectl apply -f external-ip-alloc.yaml
+#   kubectl get secret vm-external-ip -n default
+# ──────────────────────────────────────────────
+
+# ── SecretStore pointing to your IPAM ──
+# (Adjust based on your IPAM provider)
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+metadata:
+  name: ipam-store
+spec:
+  provider:
+    # Option 1: HTTP API (Infoblox, custom IPAM)
+    generic:
+      provider:
+        webhook:
+          url: "https://ipam.example.com/api/allocate"
+          body: '{"pool": "production-external", "requestId": "{{ .requestId }}"}'
+          caProvider:
+            type: ConfigMap
+            name: ipam-ca-cert
+            key: ca.crt
+          headers:
+            - name: Authorization
+              value: "Bearer ${IPAM_TOKEN}"
+          results:
+            - name: requestId
+              valueFrom:
+                jsonPath: "{.requestId}"
+            - name: ip
+              valueFrom:
+                jsonPath: "{.ip}"
+
+    # Option 2: AWS Secrets Manager
+    # aws:
+    #   service: SecretsManager
+    #   region: us-east-1
+    #   authRef:
+    #     name: aws-creds
+    #   region: us-east-1
+    #   secretRefs:
+    #   - key: ip
+    #     name: ipam-ip
+    #     namespace: default
+
+# ── ExternalSecret that reads the allocated IP ──
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: vm-external-ip
+  namespace: default
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: ipam-store
+    kind: ClusterSecretStore
+  target:
+    name: vm-external-ip-secret
+    creationPolicy: Owner
+  data:
+    - secretKey: ipAddress
+      remoteRef:
+        key: /external-ips/next
+        property: ip
+    - secretKey: gateway
+      remoteRef:
+        key: /external-ips/config
+        property: gateway

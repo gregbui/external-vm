@@ -1,0 +1,52 @@
+---
+# ──────────────────────────────────────────────
+# Example Claim — ExternalVM
+# ──────────────────────────────────────────────
+# This claim provisions a VM on an external network.
+# IP allocation is handled by External Secrets.
+#
+# Prerequisites:
+#   1. Install the XRD:  kubectl apply -f xrd.yaml
+#   2. Install the Composition:  kubectl apply -f composition.yaml
+#   3. Install External IP Allocation:  kubectl apply -f external-ip-alloc.yaml
+#   4. Ensure Multus CNI is installed on the cluster
+#   5. Ensure KubeVirt (OpenShift Virtualization) is installed
+#   6. Ensure the Kubernetes Provider is installed and configured
+#
+# Usage:
+#   kubectl apply -f external-ip-alloc.yaml  # IP allocation
+#   kubectl apply -f claim.yaml              # VM provisioning
+#   kubectl get externalvm my-external-vm -o yaml
+#   kubectl get vm -n default
+#   kubectl get networkattachmentdefinition -n default
+# ──────────────────────────────────────────────
+
+apiVersion: myorg.io/v1alpha1
+kind: ExternalVM
+metadata:
+  name: my-external-vm
+  labels:
+    myorg.io/external-vm: "true"
+    team: platform
+    environment: production
+spec:
+  # ── VM Configuration ──
+  vmName: web-server-01
+  cpu: 4
+  memory: 8Gi
+  diskSize: 40Gi
+  image: quay.io/example/rhel9-web:latest
+
+  # ── Network Configuration ──
+  networkName: external-web-net
+  namespace: default
+
+  # ── External Network Details ──
+  bridgeName: br-ex
+  subnet: "10.20.30.0/24"
+  gateway: "10.20.30.1"
+  ipRangeStart: "10.20.30.100"
+  ipRangeEnd: "10.20.30.200"
+
+  # ── IP Pool Reference ──
+  externalIPPool: production-external-ips

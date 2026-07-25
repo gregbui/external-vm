@@ -1,0 +1,162 @@
+---
+# ──────────────────────────────────────────────
+# Infoblox WAPI Integration for External Secrets
+# ──────────────────────────────────────────────
+# Configures External Secrets Operator to allocate
+# static IPs from Infoblox NIOS via WAPI.
+#
+# Infoblox WAPI Endpoints Used:
+#   POST /wapi/v2.12/ipv4address
+#     Allocates a static IP address
+#   POST /wapi/v2.12/record:host
+#     Creates DNS host record
+#   POST /wapi/v2.12/lease
+#     Manages DHCP lease
+#
+# Prerequisites:
+#   1. External Secrets Operator installed
+#   2. Infoblox WAPI endpoint accessible
+#   3. Service account with WAPI write permissions
+#   4. TLS certificate for Infoblox (if self-signed)
+#
+# Usage:
+#   kubectl apply -f infoblox-wapi.yaml
+#   kubectl get secret vm-external-ip -n default
+# ──────────────────────────────────────────────
+
+# ──────────────────────────────────────────────
+# 1. Infoblox WAPI Credentials Secret
+# ──────────────────────────────────────────────
+# Store Infoblox credentials in Kubernetes Secret
+# (use your own credential management in production)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: infoblox-credentials
+  namespace: crossplane-system
+type: Opaque
+stringData:
+  # Infoblox WAPI credentials
+  username: "admin"
+  password: "${INFOBLOX_PASSWORD}"
+  # Optional: WAPI token (alternative to basic auth)
+  # token: "${INFOBLOX_TOKEN}"
+
+# ──────────────────────────────────────────────
+# 2. Infoblox CA Certificate (if self-signed)
+# ──────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: infoblox-wapi-ca-cert
+  namespace: crossplane-system
+data:
+  # Replace with your Infoblox CA certificate
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    ${INFOBLOX_CA_CERTIFICATE}
+    -----END CERTIFICATE-----
+
+# ──────────────────────────────────────────────
+# 3. ClusterSecretStore — Infoblox WAPI Endpoint
+# ──────────────────────────────────────────────
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+metadata:
+  name: infoblox-wapi-store
+spec:
+  provider:
+    # Webhook provider calls Infoblox WAPI REST API
+    webhook:
+      # Infoblox WAPI base URL
+      url:
+        # This template is replaced with the actual allocation request
+        valueTemplate: "https://{{ .infobloxHost }}/wapi/v2.12/ipv4address"
+      # Headers for WAPI authentication
+      headers:
+        - name: Content-Type
+          value: application/json
+        - name: Accept
+          value: application/json
+        - name: X-Auth-Token
+          value: "{{ .token }}"
+      # CA certificate for TLS verification
+      caProvider:
+        type: ConfigMap
+        name: infoblox-wapi-ca-cert
+        key: ca.crt
+      # Request body — allocates IP from Infoblox
+      body:
+        # This is a template that gets filled in by External Secrets
+        valueTemplate: >-
+          {
+            "configureForDHCP": false,
+            "ipv4address": "",
+            "mac": "{{ .macAddress }}",
+            "name": "{{ .hostname }}",
+            "comment": "Managed by Crossplane - VM: {{ .vmName }}",
+            "network_view": "{{ .networkView }}",
+            "extattrs": {
+              "VM Name": { "value": "{{ .vmName }}" },
+              "Crossplane XR": { "value": "{{ .xrName }}" }
+            }
+          }
+      # Results — extract the allocated IP from response
+      results:
+        # Extract the allocated IP address
+        - name: ipAddress
+          valueFrom:
+            jsonPath: "{.ipv4address}"
+        # Extract the network reference
+        - name: networkRef
+          valueFrom:
+            jsonPath: "{.network}"
+        # Extract the EAO reference (for cleanup)
+        - name: eaoreference
+          valueFrom:
+            jsonPath: "{._ref}"
+
+# ──────────────────────────────────────────────
+# 4. ExternalSecret — VM IP Allocation
+# ──────────────────────────────────────────────
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: vm-external-ip
+  namespace: default
+spec:
+  # Refresh interval — Infoblox will renew leases periodically
+  refreshInterval: 1h
+  # Reference the Infoblox ClusterSecretStore
+  secretStoreRef:
+    name: infoblox-wapi-store
+    kind: ClusterSecretStore
+  # Target Secret — created in the same namespace
+  target:
+    name: vm-external-ip-secret
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        # Extract IP address from Infoblox response
+        ipAddress: "{{ .ipAddress }}"
+        # Extract gateway from Infoblox network config
+        gateway: "{{ .gateway }}"
+        # Extract subnet mask
+        subnetMask: "{{ .subnetMask }}"
+        # Extract DNS servers
+        dnsServers: "{{ .dnsServers }}"
+        # Extract hostname
+        hostname: "{{ .hostname }}"
+        # Extract MAC address
+        macAddress: "{{ .macAddress }}"
+  # Data — what to read from Infoblox
+  data:
+    - secretKey: ipAddress
+      remoteRef:
+        key: /external-ips/next
+        property: ip
+    - secretKey: gateway
+      remoteRef:
+        key: /external-ips/config
+        property: gateway
