@@ -1,0 +1,10 @@
+apiVersion: pkg.crossplane.io/v1beta1
+kind: Function
+metadata:
+  name: crossplane-function-ip-inject-fn
+  labels:
+    app: ip-inject-fn
+  annotations:
+    render.crossplane.io/runtime: "Development"
+spec:
+  package: example.com/my-org/external-vm-fn/ip-inject-fn:latest

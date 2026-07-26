@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -14,11 +15,16 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+var claimFile string
+
+func init() {
+	flag.StringVar(&claimFile, "claim-file", "", "Path to claim YAML file")
+}
+
 func TestRenderClaim(t *testing.T) {
-	claimFile := os.Getenv("CLAIM_FILE")
 	if claimFile == "" {
-		fmt.Println("Usage: CLAIM_FILE=<claim.yaml> go test ./functions/data-disk-fn -run TestRenderClaim -v")
-		t.Skip("no CLAIM_FILE set")
+		fmt.Println("Usage: go test ./functions/data-disk-fn -run TestRenderClaim -v -claim-file=claim.yaml")
+		t.Skip("no -claim-file set")
 	}
 
 	claimBytes, err := os.ReadFile(claimFile)

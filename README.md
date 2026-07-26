@@ -1,187 +1,218 @@
 # Crossplane Composition: External VM with Static IP
 
-This directory contains a **traditional Crossplane composition** (no custom functions)
-that provisions a KubeVirt VirtualMachine on OpenShift Virtualization, attached to an
-external network via Multus.
+Provisions a KubeVirt VirtualMachine on OpenShift Virtualization with a Multus-attached
+external network and static IP allocation from Infoblox NIOS via WAPI.
+
+## Quick Overview
+
+| Aspect | Detail |
+|---|---|
+| **XR Kind** | `ExternalVM.myorg.io` (v1alpha1) |
+| **Composition** | `external-vm-composition` (pipeline mode) |
+| **Composed Resources** | NetworkAttachmentDefinition (Multus) + VirtualMachine (KubeVirt) |
+| **IPAM** | Infoblox NIOS via WAPI (direct HTTP calls) |
+| **Cloud-Init IP** | `ip-inject-fn` pipeline function allocates IP + DNS, injects static config |
+| **Data Disks** | Handled by `data-disk-fn` pipeline step |
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        User / Claim                             │
-│                   ExternalVM.myorg.io                           │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Composition (YAML)                         │
-│                                                                 │
-│  composedResources:                                             │
-│    1. NetworkAttachmentDefinition (Multus)                      │
-│       - CNI config with bridge, IPAM                            │
-│       - Created by Kubernetes Provider                          │
-│                                                                 │
-│    2. VirtualMachine (KubeVirt)                                 │
-│       - Domain: CPU, memory, disks                              │
-│       - Networks: external (Multus) + pod                       │
-│       - Volumes: containerDisk + cloudInitNoCloud               │
-│       - Created by Kubernetes Provider                          │
-│                                                                 │
-│  patches:                                                       │
-│    - FromCompositeFieldPath: XR → composed resources            │
-│    - ToCompositeFieldPath: composed → XR status                 │
-│    - Transforms: string formatting for CNI config               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  External Secrets (IPAM)                        │
-│                                                                 │
-│  ClusterSecretStore → IPAM API                                  │
-│       │                                                         │
-│       ▼                                                         │
-│  ExternalSecret → vm-external-ip-secret                         │
-│       │                                                         │
-│       ▼                                                         │
-│  Secret → available for composition patches                     │
-└─────────────────────────────────────────────────────────────────┘
+User Claim (ExternalVM)
+        │
+        ▼
+┌─── Composition (Pipeline Mode) ──────────────────────┐
+│                                                       │
+│  composedResources:                                   │
+│    1. NetworkAttachmentDefinition ──► Multus bridge   │
+│    2. VirtualMachine        ──► KubeVirt VM          │
+│                                                       │
+│  patches:                                             │
+│    FromCompositeFieldPath: XR spec -> VM/NAD fields   │
+│    CombineFromCompositeFieldPath: rebuild NAD config  │
+│    FromComposedFieldPath:   NAD name -> VM network    │
+│    ToCompositeFieldPath:    VM/NAD status -> XR       │
+│                                                       │
+│  pipeline:                                            │
+│    1. data-disk-reconciler ──► data-disk-fn          │
+│       (creates PVCs, patches VM disks/volumes)        │
+│    2. ip-inject ──► ip-inject-fn                     │
+│       (calls Infoblox WAPI, injects static IP)        │
+└───────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─── Infoblox WAPI ────────────────────────────────────┐
+│  ip-inject-fn ──► POST /wapi/v2.12/ipv4address       │
+│       │                                               │
+│       ▼                                               │
+│  POST /wapi/v2.12/record:host (DNS)                  │
+│       │                                               │
+│       ▼                                               │
+│  cloud-init network-config v2 ──► VM guest OS        │
+└───────────────────────────────────────────────────────┘
 ```
 
 ## Files
 
 | File | Description |
-|------|-------------|
-| `xrd.yaml` | CompositeResourceDefinition — defines the `ExternalVM` XR |
-| `composition.yaml` | Composition — composedResources + patches |
-| `external-ip-alloc.yaml` | ExternalSecret + ClusterSecretStore for IP allocation |
-| `claim.yaml` | Example claim — how users request an external VM |
+|---|---|
+| `xrd.yaml` | CompositeResourceDefinition — `ExternalVM.myorg.io`. Spec: vmName, cpu, memory, diskSize, image, network config, externalIPPool, dataDisks[]. Status: externalIP, infobloxIPRef, nadName, vmUID, dataDisks[]. |
+| `composition.yaml` | Composition with pipeline mode. Patches: XR spec -> VM/NAD fields, NAD name -> VM network ref, VM/NAD status -> XR status. Pipeline steps: data-disk-fn + ip-inject-fn. |
+| `infoblox-wapi.yaml` | Infoblox WAPI credentials (K8s Secret), CA cert (ConfigMap), and ClusterSecretStore for ExternalSecrets (legacy/optional). |
+| `claim.yaml` | Example claim — 4 CPU, 8Gi RAM, 40Gi disk, 2 data disks (data: 50Gi, logs: 20Gi). |
+| `functions/ip-inject-fn/` | Pipeline function: calls Infoblox WAPI for IP allocation + DNS, injects static network config into cloud-init. |
+| `functions/data-disk-fn/` | Pipeline function: creates PVCs for data disks, patches VM disks/volumes. |
+| `.gitignore` | Git ignore rules. |
 
 ## How It Works
 
-### 1. Dynamic IP Allocation (External Secrets)
+### 1. IP Allocation (Infoblox WAPI)
 
-The External Secrets Operator reads IPs from an external IPAM:
+The `ip-inject-fn` pipeline function calls Infoblox WAPI directly:
 
+1. **Allocate IP**: POST `/wapi/v2.12/ipv4address` with VM name, network view, and extattrs
+2. **Create DNS**: POST `/wapi/v2.12/record:host` for reverse DNS lookup
+3. **Store ref**: Infoblox `_ref` saved in XR `status.infobloxIPRef` for lifecycle management
+
+Credentials are read from K8s Secret `infoblox-credentials` (namespace: `crossplane-system`).
+The WAPI endpoint is configured via the `INFOBLOX_HOST` env var.
+
+### 2. NetworkAttachmentDefinition (Multus)
+
+Composition creates a NAD via `CombineFromCompositeFieldPath` — rebuilds the CNI JSON config from XR spec fields (`bridgeName`, `subnet`, `gateway`). Patches NAD `metadata.name` from `spec.networkName`.
+
+### 3. VirtualMachine (KubeVirt)
+
+Composition creates a KubeVirt VM with:
+- `containerDisk` from `spec.image` (patched from XR)
+- `metadata.name` from `spec.vmName`, `metadata.namespace` from `spec.namespace`
+- CPU cores from `spec.cpu`, memory from `spec.memory`
+- Multus network reference patched from NAD name (`FromComposedFieldPath`)
+- Data disks appended by `data-disk-fn` (PVCs + disk/volume patches)
+
+### 4. Cloud-Init Static IP Injection
+
+After IP allocation, `ip-inject-fn` builds cloud-init **network-config v2** with static IP on `eth1`:
 ```yaml
-apiVersion: external-secrets.io/v1beta1
-kind: ExternalSecret
-metadata:
-  name: vm-external-ip
-  namespace: default
-spec:
-  refreshInterval: 1h
-  secretStoreRef:
-    name: ipam-store
-    kind: ClusterSecretStore
-  target:
-    name: vm-external-ip-secret
-  data:
-    - secretKey: ipAddress
-      remoteRef:
-        key: /external-ips/next
-        property: ip
-    - secretKey: gateway
-      remoteRef:
-        key: /external-ips/config
-        property: gateway
+network:
+  config:
+    version: 2
+    ethernets:
+      eth1:
+        dhcp4: false
+        addresses: ["<allocated-ip>/24"]
+        nameservers:
+          addresses: ["8.8.8.8", "1.1.1.1"]
+        routes:
+          - to: 0.0.0.0/0
+            via: <gateway>
+            metric: 100
 ```
 
-The IPAM API returns JSON: `{"ip": "10.20.30.100", "requestId": "abc123"}`
+Patches the VM's `cloudInitNoCloud.userData` and sets `status.externalIP` on the XR.
 
-### 2. NetworkAttachmentDefinition
+### 5. XR Status
 
-The composition creates a Multus NAD with:
-- Bridge CNI plugin (`br-ex`)
-- IPAM with static subnet/gateway
-- Labels for tracking
-
-### 3. VirtualMachine
-
-The composition creates a KubeVirt VM with:
-- ContainerDisk from specified image
-- Cloud-init that configures static IP on `eth1`
-- Network interface attached to the NAD via Multus
-- Pod network for cluster communication
-
-### 4. IP Configuration
-
-The VM's cloud-init configures the static IP on boot:
-```yaml
-runcmd:
-  - |
-    nmcli con add type ethernet con-name external-iface ifname eth1 \
-      ipv4.address 10.20.30.100/24 \
-      ipv4.gateway 10.20.30.1 \
-      ipv4.method manual
-    nmcli con up external-iface
-```
+- `status.nadName` <- NAD `metadata.name`
+- `status.vmUID` <- VM `metadata.uid`
+- `status.conditions` <- VM `status.conditions`
+- `status.externalIP` <- set by `ip-inject-fn`
+- `status.infobloxIPRef` <- Infoblox reference for IP release
 
 ## Prerequisites
 
-1. **OpenShift Virtualization** (KubeVirt) installed on the cluster
-2. **Multus CNI** installed for external network attachment
-3. **Crossplane** with Kubernetes Provider installed
-4. **External Secrets Operator** installed (for dynamic IP allocation)
-5. **IPAM** configured with an API endpoint (Infoblox, Kea, custom)
+1. OpenShift Virtualization (KubeVirt)
+2. Multus CNI
+3. Crossplane + Kubernetes Provider
+4. Infoblox NIOS with WAPI enabled
+5. `crossplane-function-data-disk-fn` deployed (for data disk PVCs)
+6. `crossplane-function-ip-inject-fn` deployed (for IP allocation + injection)
 
 ## Deployment
 
 ```bash
-# 1. Install the XRD
-kubectl apply -f xrd.yaml
-
-# 2. Install the composition
-kubectl apply -f composition.yaml
-
-# 3. Install External IP Allocation
-kubectl apply -f external-ip-alloc.yaml
-
-# 4. Request an external VM
-kubectl apply -f claim.yaml
-
-# 5. Verify
-kubectl get externalvm my-external-vm
-kubectl get vm -n default
-kubectl get networkattachmentdefinition -n default
-kubectl get secret vm-external-ip -n default
+kubectl apply -f xrd.yaml                          # 1. XRD
+kubectl apply -f infoblox-wapi.yaml                # 2. Infoblox credentials + CA
+kubectl apply -f functions/ip-inject-fn/           # 3. IP inject function
+kubectl apply -f functions/data-disk-fn/           # 4. Data disk function
+kubectl apply -f composition.yaml                  # 5. Composition
+kubectl apply -f claim.yaml                        # 6. Claim
+kubectl get externalvm my-external-vm              # 7. Verify
 ```
 
-## Result
+## Patch Reference
 
-After applying the claim, you'll have:
-
-- An **ExternalVM** composite resource in `Ready` status
-- A **VirtualMachine** in the `default` namespace, running with:
-  - The specified CPU, memory, and disk
-  - A network interface attached to the external network
-  - Cloud-init configured to set the static IP on boot
-- A **NetworkAttachmentDefinition** for Multus to attach the VM
-- An **ExternalSecret** that keeps the IP in sync with the IPAM
-
-## Patch Flow
-
-```
-XR spec fields ──────────────────────────────────────────────────┐
-                                                                ▼
-FromCompositeFieldPath patches ──► composedResources.base ──► Kubernetes API
-                                                                │
-                                                                ▼
-ToCompositeFieldPath patches ◄─── composedResources.status ◄─── Kubernetes API
-                                                                │
-                                                                ▼
-XR status fields
-```
-
-## Traditional vs. Composition Functions
-
-| Aspect | Traditional (this) | Composition Functions |
+### XR spec -> VM
+| Patch | XR Field | VM Field |
 |---|---|---|
-| **Code** | Pure YAML | Go functions |
-| **Deployment** | `kubectl apply` | Build + deploy containers |
-| **Complexity** | Low | High |
-| **Flexibility** | Limited to patches | Full Go programming |
-| **Maintenance** | YAML only | Go + containers + tests |
-| **Best for** | Simple resource creation | Complex orchestration |
+| vmName | `spec.vmName` | `metadata.name` |
+| namespace | `spec.namespace` | `metadata.namespace` |
+| cpu | `spec.cpu` | `spec.template.spec.domain.cpu.cores` |
+| memory | `spec.memory` | `spec.template.spec.domain.resources.requests.memory` |
+| image | `spec.image` | `spec.template.spec.volumes[0].containerDisk.image` |
 
-This traditional approach is the **recommended starting point** for most use cases.
-Only move to composition functions when you need logic that patches can't express.
+### XR spec -> NAD
+| Patch | XR Field | NAD Field |
+|---|---|---|
+| networkName | `spec.networkName` | `metadata.name` |
+| CNI config | `bridgeName`, `subnet`, `gateway` | `spec.config` (JSON rebuild) |
+
+### Cross-resource
+| Patch | From | To |
+|---|---|---|
+| NAD -> VM network | NAD `metadata.name` | VM `spec.template.spec.networks[0].multus.networkName` |
+
+### Composed status -> XR status
+| Patch | From | XR Field |
+|---|---|---|
+| NAD name | NAD `metadata.name` | `status.nadName` |
+| VM uid | VM `metadata.uid` | `status.vmUID` |
+| VM conditions | VM `status.conditions` | `status.conditions` |
+
+## Pipeline Functions
+
+### data-disk-fn
+- Creates PVCs for each entry in `spec.dataDisks[]`
+- Patches VM's `spec.template.spec.domain.devices.disks` array
+- Patches VM's `spec.template.spec.volumes` array
+
+### ip-inject-fn
+- Reads Infoblox credentials from K8s Secret (`infoblox-credentials`)
+- Calls Infoblox WAPI:
+  - `POST /wapi/v2.12/ipv4address` — allocates static IP
+  - `POST /wapi/v2.12/record:host` — creates DNS A record
+- Reuses previously allocated IP on re-reconciliation (stored in XR status)
+- Injects cloud-init network-config v2 with static IP into VM's `cloudInitNoCloud.userData`
+- Sets `status.externalIP` and `status.infobloxIPRef` on XR
+- DNS creation failure is non-fatal (IP is still allocated)
+
+## Infoblox Configuration
+
+The function requires these env vars (set in the deployment):
+
+| Env Var | Source | Description |
+|---|---|---|
+| `INFOBLOX_HOST` | Secret `infoblox-credentials.data.host` | WAPI endpoint hostname |
+| `INFOBLOX_USER` | Secret `infoblox-credentials.data.username` | WAPI username |
+| `INFOBLOX_PASSWORD` | Secret `infoblox-credentials.data.password` | WAPI password |
+| `INFOBLOX_CA_CERT_PATH` | Env (mounted from ConfigMap) | Path to CA cert for self-signed certs |
+
+The `infoblox-credentials` secret must also include a `host` key:
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: infoblox-credentials
+  namespace: crossplane-system
+type: Opaque
+stringData:
+  host: "infoblox.example.com"
+  username: "admin"
+  password: "${INFOBLOX_PASSWORD}"
+```
+
+## Known Gaps / TODOs
+
+- **IP release on VM deletion** — `status.infobloxIPRef` is stored but no finalizer releases the IP back to Infoblox when the VM is deleted. Add a finalizer + release logic.
+- **diskSize not propagated** — `spec.diskSize` has no target in KubeVirt's `containerDisk` (size is image-determined).
+- **networkView not required** — `spec.networkView` is optional; if omitted, Infoblox uses the default network view.
+- **No tests** — No unit tests, integration tests, or composition validation.

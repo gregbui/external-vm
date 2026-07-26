@@ -73,8 +73,110 @@ spec:
                       hostname: vm-external
               # data disk volumes appended here by data-disk-fn
 
+  patches:
+
+    # ── XR spec -> VM (metadata) ──
+    - type: FromCompositeFieldPath
+      description: Propagate vmName to VM metadata.name
+      from: spec.vmName
+      to: metadata.name
+      composedResources:
+        - virtual-machine
+
+    - type: FromCompositeFieldPath
+      description: Propagate namespace to VM metadata.namespace
+      from: spec.namespace
+      to: metadata.namespace
+      composedResources:
+        - virtual-machine
+
+    # ── XR spec -> VM (resources) ──
+    - type: FromCompositeFieldPath
+      description: Propagate cpu to VM cpu cores
+      from: spec.cpu
+      to: spec.template.spec.domain.cpu.cores
+      composedResources:
+        - virtual-machine
+
+    - type: FromCompositeFieldPath
+      description: Propagate memory to VM memory requests
+      from: spec.memory
+      to: spec.template.spec.domain.resources.requests.memory
+      composedResources:
+        - virtual-machine
+
+    # ── XR spec -> VM (disks) ──
+    - type: FromCompositeFieldPath
+      description: Propagate image to VM containerDisk image
+      from: spec.image
+      to: spec.template.spec.volumes[0].containerDisk.image
+      composedResources:
+        - virtual-machine
+
+    # ── XR spec -> NAD (metadata) ──
+    - type: FromCompositeFieldPath
+      description: Propagate networkName to NAD metadata.name
+      from: spec.networkName
+      to: metadata.name
+      composedResources:
+        - network-attachment-definition
+
+    # ── XR spec -> NAD (config) ──
+    - type: CombineFromCompositeFieldPath
+      description: Build NAD CNI config from XR network fields
+      from:
+        - spec.bridgeName
+        - spec.subnet
+        - spec.gateway
+        - spec.gateway
+      to: spec.config
+      transform:
+        type: string
+        string:
+          fmt: '{"cniVersion":"0.3.1","type":"bridge","bridge":"%s","ipam":{"type":"host-local","subnet":"%s","gateway":"%s","routes":[{"dst":"0.0.0.0/0","gw":"%s"}]}}'
+      composedResources:
+        - network-attachment-definition
+
+    # ── NAD name -> VM network reference ──
+    - type: FromComposedFieldPath
+      description: Wire VM multus network to actual NAD name
+      from: metadata.name
+      fromComposedResources:
+        - network-attachment-definition
+      to: spec.template.spec.networks[0].multus.networkName
+      toComposedResources:
+        - virtual-machine
+
+    # ── Composed status -> XR status ──
+    - type: ToCompositeFieldPath
+      description: Propagate NAD name to XR status
+      from: metadata.name
+      fromComposedResources:
+        - network-attachment-definition
+      to: status.nadName
+
+    - type: ToCompositeFieldPath
+      description: Propagate VM uid to XR status
+      from: metadata.uid
+      fromComposedResources:
+        - virtual-machine
+      to: status.vmUID
+
+    - type: ToCompositeFieldPath
+      description: Propagate VM conditions to XR status
+      from: status.conditions
+      fromComposedResources:
+        - virtual-machine
+      to: status.conditions
+
   pipeline:
     # Data disks: creates PVCs, patches VM disks/volumes dynamically
     - step: data-disk-reconciler
       functionRef:
         name: crossplane-function-data-disk-fn
+    # IP inject: reads ExternalSecret secret, injects static IP into cloud-init
+    - step: ip-inject
+      functionRef:
+        name: crossplane-function-ip-inject-fn
+      policy:
+        onMissingField: PASS

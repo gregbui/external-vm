@@ -37,6 +37,7 @@ metadata:
 type: Opaque
 stringData:
   # Infoblox WAPI credentials
+  host: "infoblox.example.com"
   username: "admin"
   password: "${INFOBLOX_PASSWORD}"
   # Optional: WAPI token (alternative to basic auth)
