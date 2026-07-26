@@ -6,15 +6,17 @@ metadata:
     type: external-network
     provider: kubevirt
 spec:
+  mode: Pipeline
+  compositeTypeRef:
+    apiVersion: myorg.io/v1alpha1
+    kind: ExternalVM
   compositeResourceSelector:
     matchLabels:
       myorg.io/external-vm: "true"
   writeConnectionSecretsToNamespace: crossplane-system
   composedResources:
 
-    # ──────────────────────────────────────────────
-    # Resource 1: NetworkAttachmentDefinition
-    # ──────────────────────────────────────────────
+    # ── NAD ──
     - name: network-attachment-definition
       base:
         apiVersion: k8s.cni.cncf.io/v1
@@ -25,9 +27,7 @@ spec:
         spec:
           config: '{"cniVersion":"0.3.1","type":"bridge","bridge":"br-ex","ipam":{"type":"host-local","subnet":"10.20.30.0/24","gateway":"10.20.30.1","routes":[{"dst":"0.0.0.0/0","gw":"10.20.30.1"}]}}'
 
-    # ──────────────────────────────────────────────
-    # Resource 2: VirtualMachine
-    # ──────────────────────────────────────────────
+    # ── VirtualMachine ──
     - name: virtual-machine
       base:
         apiVersion: kubevirt.io/v1
@@ -56,12 +56,12 @@ spec:
                     - name: external
                       bridge: {}
                       model: virtio
-              networks:
-                - name: external
-                  multus:
-                    networkName: default/network-attachment-definition
-                - name: podnetwork
-                  pod: {}
+                networks:
+                  - name: external
+                    multus:
+                      networkName: default/network-attachment-definition
+                  - name: podnetwork
+                    pod: {}
               volumes:
                 - name: rootdisk
                   containerDisk:
@@ -71,113 +71,10 @@ spec:
                     userData: |
                       #cloud-config
                       hostname: vm-external
-                      runcmd:
-                        - |
-                          nmcli con add type ethernet con-name external-iface ifname eth1 \
-                            ipv4.address 10.20.30.100/24 \
-                            ipv4.gateway 10.20.30.1 \
-                            ipv4.method manual
-                          nmcli con up external-iface
+              # data disk volumes appended here by data-disk-fn
 
-  patches:
-
-    # ──────────────────────────────────────────────
-    # NAD Patches
-    # ──────────────────────────────────────────────
-
-    # Patch NAD name
-    - type: FromCompositeFieldPath
-      fromFieldPath: spec.networkName
-      toFieldPath: metadata.name
-      compositeToFieldPath: .spec.networkName
-      policies:
-        compositeToFieldPath: Optional
-
-    # Patch NAD namespace
-    - type: FromCompositeFieldPath
-      fromFieldPath: spec.namespace
-      toFieldPath: metadata.namespace
-      compositeToFieldPath: .spec.namespace
-      policies:
-        compositeToFieldPath: Optional
-
-    # Patch NAD CNI config with dynamic subnet/gateway
-    - type: FromCompositeFieldPath
-      fromFieldPath: spec.subnet
-      toFieldPath: spec.config
-      transforms:
-        - type: string
-          string:
-            fmt: '{"cniVersion":"0.3.1","type":"bridge","bridge":"%s","ipam":{"type":"host-local","subnet":"%s","gateway":"%s","routes":[{"dst":"0.0.0.0/0","gw":"%s"}]}}'
-            type: format
-
-    # Patch NAD labels
-    - type: FromCompositeFieldPath
-      fromFieldPath: metadata.name
-      toFieldPath: metadata.labels.xr-name
-      compositeToFieldPath: .metadata.name
-
-    # Write NAD name to XR status
-    - type: ToCompositeFieldPath
-      fromFieldPath: metadata.name
-      toFieldPath: status.nadName
-
-    # ──────────────────────────────────────────────
-    # VM Patches
-    # ──────────────────────────────────────────────
-
-    # Patch VM name
-    - type: FromCompositeFieldPath
-      fromFieldPath: spec.vmName
-      toFieldPath: metadata.name
-      compositeToFieldPath: .spec.vmName
-      policies:
-        compositeToFieldPath: Optional
-
-    # Patch VM namespace
-    - type: FromCompositeFieldPath
-      fromFieldPath: spec.namespace
-      toFieldPath: metadata.namespace
-      compositeToFieldPath: .spec.namespace
-      policies:
-        compositeToFieldPath: Optional
-
-    # Patch VM labels
-    - type: FromCompositeFieldPath
-      fromFieldPath: spec.vmName
-      toFieldPath: metadata.labels.kubevirt.io/domain
-      compositeToFieldPath: .spec.vmName
-
-    - type: FromCompositeFieldPath
-      fromFieldPath: metadata.name
-      toFieldPath: metadata.labels.xr-name
-      compositeToFieldPath: .metadata.name
-
-    # Patch VM CPU
-    - type: FromCompositeFieldPath
-      fromFieldPath: spec.cpu
-      toFieldPath: spec.template.spec.domain.cpu.cores
-      compositeToFieldPath: .spec.cpu
-
-    # Patch VM Memory
-    - type: FromCompositeFieldPath
-      fromFieldPath: spec.memory
-      toFieldPath: spec.template.spec.domain.memory.guest
-      compositeToFieldPath: .spec.memory
-
-    # Patch VM Image
-    - type: FromCompositeFieldPath
-      fromFieldPath: spec.image
-      toFieldPath: spec.template.spec.volumes[0].containerDisk.image
-      compositeToFieldPath: .spec.image
-
-    # Patch VM NAD reference
-    - type: FromCompositeFieldPath
-      fromFieldPath: spec.networkName
-      toFieldPath: spec.template.spec.networks[0].multus.networkName
-      compositeToFieldPath: .spec.networkName
-
-    # Write VM UID to XR status
-    - type: ToCompositeFieldPath
-      fromFieldPath: metadata.uid
-      toFieldPath: status.vmUID
+  pipeline:
+    # Data disks: creates PVCs, patches VM disks/volumes dynamically
+    - step: data-disk-reconciler
+      functionRef:
+        name: crossplane-function-data-disk-fn

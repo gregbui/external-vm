@@ -1,0 +1,42 @@
+# ──────────────────────────────────────────────
+# Multi-disk Claim — for testing multiple data disks
+# ──────────────────────────────────────────────
+# This claim exercises the function with 2 data disks:
+#   1. "data"   — 50Gi, default storage class
+#   2. "logs"   — 20Gi, fast-ssd storage class
+#
+# Usage:
+#   ./render.sh claim-multi-disk.yaml
+# ──────────────────────────────────────────────
+
+apiVersion: myorg.io/v1alpha1
+kind: ExternalVM
+metadata:
+  name: multi-disk-vm
+  labels:
+    myorg.io/external-vm: "true"
+    team: platform
+    environment: staging
+spec:
+  # ── VM Configuration ──
+  vmName: multi-disk-server
+  cpu: 8
+  memory: 16Gi
+  image: quay.io/example/rhel9-web:latest
+
+  # ── Network Configuration ──
+  networkName: staging-web-net
+  namespace: staging
+
+  # ── External Network Details ──
+  bridgeName: br-staging
+  subnet: "10.30.40.0/24"
+  gateway: "10.30.40.1"
+
+  # ── Data Disks ──
+  dataDisks:
+    - name: data
+      size: 50Gi
+    - name: logs
+      size: 20Gi
+      storageClassName: fast-ssd

@@ -1,0 +1,31 @@
+# ──────────────────────────────────────────────
+# Function resource for data-disk-fn
+# ──────────────────────────────────────────────
+# This Function CRD is used by 'crossplane composition render'
+# to resolve the pipeline step reference:
+#
+#   spec.pipeline[].functionRef.name: crossplane-function-data-disk-fn
+#
+# The render.crossplane.io/runtime annotation tells the render
+# engine to connect to our locally-running function on :9443
+# instead of pulling a Docker image.
+#
+# Before rendering:
+#   go run . --insecure --address :9443
+#
+# Then:
+#   crossplane composition render claim.yaml composition.yaml function.yaml
+# ──────────────────────────────────────────────
+
+apiVersion: pkg.crossplane.io/v1beta1
+kind: Function
+metadata:
+  name: crossplane-function-data-disk-fn
+  labels:
+    app: data-disk-fn
+  annotations:
+    # Use local development runtime instead of Docker
+    render.crossplane.io/runtime: "Development"
+spec:
+  # Function package reference (required even for Development runtime)
+  package: example.com/my-org/external-vm-fn/data-disk-fn:latest

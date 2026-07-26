@@ -58,6 +58,30 @@ spec:
                 namespace:
                   type: string
                   default: "default"
+                # ── Data Disks ──
+                # Additional PVC-backed disks appended to the VM on top of the
+                # base OS disk (rootdisk). Variable length — specify 1 to N.
+                # The data-disk-fn Function creates PVCs and patches the VM.
+                dataDisks:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - name
+                      - size
+                    properties:
+                      name:
+                        type: string
+                        description: Disk name (used as PVC suffix and disk identifier).
+                        maxLength: 63
+                      size:
+                        type: string
+                        description: Disk size (e.g. "50Gi", "100Gi").
+                        pattern: '^\d+(\.\d+)?(Ki|Mi|Gi|Ti)?$'
+                      storageClassName:
+                        type: string
+                        description: StorageClass for the PVC. Cluster default if omitted.
+                        maxLength: 253
             status:
               type: object
               properties:
@@ -78,3 +102,10 @@ spec:
                   type: string
                 vmUID:
                   type: string
+                # ── Data Disk Status ──
+                # PVC names for each provisioned data disk, in order.
+                dataDisks:
+                  type: array
+                  description: Names of provisioned data disk PVCs.
+                  items:
+                    type: string

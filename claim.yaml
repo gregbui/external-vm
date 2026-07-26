@@ -7,11 +7,12 @@
 #
 # Prerequisites:
 #   1. Install the XRD:  kubectl apply -f xrd.yaml
-#   2. Install the Composition:  kubectl apply -f composition.yaml
-#   3. Install External IP Allocation:  kubectl apply -f external-ip-alloc.yaml
-#   4. Ensure Multus CNI is installed on the cluster
-#   5. Ensure KubeVirt (OpenShift Virtualization) is installed
-#   6. Ensure the Kubernetes Provider is installed and configured
+#   2. Install the Function:  kubectl apply -f function-deployment.yaml
+#   3. Install the Composition:  kubectl apply -f composition.yaml
+#   4. Install External IP Allocation:  kubectl apply -f external-ip-alloc.yaml
+#   5. Ensure Multus CNI is installed on the cluster
+#   6. Ensure KubeVirt (OpenShift Virtualization) is installed
+#   7. Ensure the Kubernetes Provider is installed and configured
 #
 # Usage:
 #   kubectl apply -f external-ip-alloc.yaml  # IP allocation
@@ -50,3 +51,13 @@ spec:
 
   # ── IP Pool Reference ──
   externalIPPool: production-external-ips
+
+  # ── Data Disks ──
+  # Variable number of data disks appended to the VM.
+  # The data-disk-fn Function creates PVCs and patches the VM dynamically.
+  dataDisks:
+    - name: data
+      size: 50Gi
+    - name: logs
+      size: 20Gi
+      storageClassName: fast-ssd

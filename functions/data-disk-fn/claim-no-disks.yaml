@@ -1,0 +1,33 @@
+# ──────────────────────────────────────────────
+# No-disks Claim — tests the early-return path
+# ──────────────────────────────────────────────
+# This claim has no dataDisks specified, so the
+# function returns immediately with a success
+# condition and creates no PVCs.
+#
+# Usage:
+#   ./render.sh claim-no-disks.yaml
+# ──────────────────────────────────────────────
+
+apiVersion: myorg.io/v1alpha1
+kind: ExternalVM
+metadata:
+  name: base-vm
+  labels:
+    myorg.io/external-vm: "true"
+    team: platform
+    environment: dev
+spec:
+  vmName: base-server
+  cpu: 2
+  memory: 4Gi
+  image: quay.io/example/rhel9:latest
+
+  networkName: dev-web-net
+  namespace: dev
+
+  bridgeName: br-dev
+  subnet: "10.40.50.0/24"
+  gateway: "10.40.50.1"
+
+  # No dataDisks — function returns early
