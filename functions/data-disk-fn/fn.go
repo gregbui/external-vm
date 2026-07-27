@@ -52,18 +52,29 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 		return rsp, nil
 	}
 
-	// Extract dataDisks from XR spec
+	// Extract spec from XR
 	spec, ok := xr.Resource.UnstructuredContent()["spec"].(map[string]any)
 	if !ok {
 		response.Fatal(rsp, fmt.Errorf("XR spec is not an object"))
 		return rsp, nil
 	}
 
+	// ── Extract diskSize for root disk ──
+	var rootDiskSize string
+	if ds, ok := spec["diskSize"].(string); ok && ds != "" {
+		rootDiskSize = ds
+	}
+
+	// ── Extract dataDisks from XR spec ──
 	dataDisksRaw, ok := spec["dataDisks"].([]any)
 	if !ok || len(dataDisksRaw) == 0 {
-		// No data disks — nothing to do
-		response.ConditionTrue(rsp, "DataDisksReconciled", "No data disks to reconcile")
-		return rsp, nil
+		// No data disks — check if we still need to create root disk PVC
+		if rootDiskSize == "" {
+			response.ConditionTrue(rsp, "DataDisksReconciled", "No data disks or root disk size to reconcile")
+			return rsp, nil
+		}
+		// Only root disk PVC needed
+		return f.createRootDiskPVC(rsp, desired, xr, rootDiskSize)
 	}
 
 	// Parse disk specs
@@ -96,15 +107,16 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 		desiredDisks = append(desiredDisks, ds)
 	}
 
-	// ── Create PVCs for each data disk ──
-	for i, ds := range desiredDisks {
-		pvcName := fmt.Sprintf("%s-%s", xr.Resource.GetName(), ds.name)
-		pvcKeyName := resource.Name(fmt.Sprintf("data-disk-%d", i))
+	// ── Create root disk PVC if diskSize specified ──
+	var rootPVCName string
+	if rootDiskSize != "" {
+		rootPVCName = fmt.Sprintf("%s-rootdisk", xr.Resource.GetName())
+		rootPVCKeyName := resource.Name("root-disk-pvc")
 
 		pvc := resource.NewDesiredComposed()
 		pvc.Resource.SetAPIVersion("v1")
 		pvc.Resource.SetKind("PersistentVolumeClaim")
-		pvc.Resource.SetName(pvcName)
+		pvc.Resource.SetName(rootPVCName)
 		pvc.Resource.SetNamespace(xr.Resource.GetNamespace())
 		pvc.Resource.SetLabels(map[string]string{
 			pvcLabelManaged: "true",
@@ -124,19 +136,16 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 			"accessModes": []any{"ReadWriteOnce"},
 			"resources": map[string]any{
 				"requests": map[string]any{
-					"storage": ds.size,
+					"storage": rootDiskSize,
 				},
 			},
 		}
-		if ds.storageClassName != "" {
-			pvcSpec["storageClassName"] = ds.storageClassName
-		}
 		pvc.Resource.Object["spec"] = pvcSpec
 
-		desired[pvcKeyName] = pvc
+		desired[rootPVCKeyName] = pvc
 	}
 
-	// ── Patch VM: add data disk entries to disks and volumes arrays ──
+	// ── Patch VM: replace volumes array, add disk/volume entries ──
 	vm, ok := desired[resource.Name(vmKeyName)]
 	if !ok {
 		// Render engine may not inject composedResources.
@@ -158,13 +167,28 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 		existingDisks = []any{}
 	}
 
-	// Get existing volumes (rootdisk, cloudinitdisk) at spec.template.spec level
+	// Build new volumes array: rootdisk (PVC ref) + cloudinitdisk + data disks
+	volumes := []any{}
+	if rootPVCName != "" {
+		volumes = append(volumes, map[string]any{
+			"name": "rootdisk",
+			"persistentVolumeClaim": map[string]any{
+				"claimName": rootPVCName,
+			},
+		})
+	}
+	// Find and add cloudinitdisk volume from existing volumes
 	existingVolumes, _ := vmSpecSpec["volumes"].([]any)
-	if existingVolumes == nil {
-		existingVolumes = []any{}
+	for _, v := range existingVolumes {
+		if vm, ok := v.(map[string]any); ok {
+			if name, ok := vm["name"].(string); ok && name == "cloudinitdisk" {
+				volumes = append(volumes, v)
+				break
+			}
+		}
 	}
 
-	// Append data disk entries
+	// Append data disk entries to both disks and volumes arrays
 	for _, ds := range desiredDisks {
 		pvcName := fmt.Sprintf("%s-%s", xr.Resource.GetName(), ds.name)
 		// Disk entry
@@ -175,7 +199,7 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 			},
 		})
 		// Volume entry
-		existingVolumes = append(existingVolumes, map[string]any{
+		volumes = append(volumes, map[string]any{
 			"name": ds.name,
 			"persistentVolumeClaim": map[string]any{
 				"claimName": pvcName,
@@ -184,7 +208,7 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 	}
 
 	devices["disks"] = existingDisks
-	vmSpecSpec["volumes"] = existingVolumes
+	vmSpecSpec["volumes"] = volumes
 	desired[resource.Name(vmKeyName)] = vm
 
 	// ── Write results ──
@@ -194,10 +218,13 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 		return rsp, nil
 	}
 
-	// Write PVC names to XR status
-	statusDisks := make([]any, len(desiredDisks))
-	for i, ds := range desiredDisks {
-		statusDisks[i] = fmt.Sprintf("%s-%s", xr.Resource.GetName(), ds.name)
+	// Write PVC names to XR status (root disk + data disks)
+	statusDisks := make([]any, 0, len(desiredDisks)+1)
+	if rootPVCName != "" {
+		statusDisks = append(statusDisks, rootPVCName)
+	}
+	for _, ds := range desiredDisks {
+		statusDisks = append(statusDisks, fmt.Sprintf("%s-%s", xr.Resource.GetName(), ds.name))
 	}
 	status, _ := xr.Resource.UnstructuredContent()["status"].(map[string]any)
 	if status == nil {
@@ -212,7 +239,102 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 	}
 
 	response.ConditionTrue(rsp, "DataDisksReconciled",
-		fmt.Sprintf("Reconciled %d data disks", len(desiredDisks)))
+		fmt.Sprintf("Reconciled root disk + %d data disks", len(desiredDisks)))
+	return rsp, nil
+}
+
+// createRootDiskPVC handles the case where only a root disk PVC is needed (no data disks).
+func (f *Function) createRootDiskPVC(rsp *fnv1.RunFunctionResponse, desired map[resource.Name]*resource.Desired, xr *resource.Composite, rootDiskSize string) (*fnv1.RunFunctionResponse, error) {
+	rootPVCName := fmt.Sprintf("%s-rootdisk", xr.Resource.GetName())
+	rootPVCKeyName := resource.Name("root-disk-pvc")
+
+	pvc := resource.NewDesiredComposed()
+	pvc.Resource.SetAPIVersion("v1")
+	pvc.Resource.SetKind("PersistentVolumeClaim")
+	pvc.Resource.SetName(rootPVCName)
+	pvc.Resource.SetNamespace(xr.Resource.GetNamespace())
+	pvc.Resource.SetLabels(map[string]string{
+		pvcLabelManaged: "true",
+	})
+	pvc.Resource.SetOwnerReferences([]metav1.OwnerReference{
+		{
+			APIVersion:         xr.Resource.GetAPIVersion(),
+			Kind:               xr.Resource.GetKind(),
+			Name:               xr.Resource.GetName(),
+			UID:                xr.Resource.GetUID(),
+			Controller:         boolPtr(true),
+			BlockOwnerDeletion: boolPtr(true),
+		},
+	})
+
+	pvcSpec := map[string]any{
+		"accessModes": []any{"ReadWriteOnce"},
+		"resources": map[string]any{
+			"requests": map[string]any{
+				"storage": rootDiskSize,
+			},
+		},
+	}
+	pvc.Resource.Object["spec"] = pvcSpec
+	desired[rootPVCKeyName] = pvc
+
+	// Patch VM volumes array to use PVC ref for rootdisk
+	vm, ok := desired[resource.Name(vmKeyName)]
+	if ok {
+		vmSpec := vm.Resource.UnstructuredContent()["spec"].(map[string]any)
+		template := vmSpec["template"].(map[string]any)
+		vmSpecSpec := template["spec"].(map[string]any)
+		domain := vmSpecSpec["domain"].(map[string]any)
+		devices := domain["devices"].(map[string]any)
+		existingDisks, _ := devices["disks"].([]any)
+		if existingDisks == nil {
+			existingDisks = []any{}
+		}
+
+		volumes := []any{
+			map[string]any{
+				"name": "rootdisk",
+				"persistentVolumeClaim": map[string]any{
+					"claimName": rootPVCName,
+				},
+			},
+		}
+		// Find cloudinitdisk volume from existing
+		existingVolumes, _ := vmSpecSpec["volumes"].([]any)
+		for _, v := range existingVolumes {
+			if vm, ok := v.(map[string]any); ok {
+				if name, ok := vm["name"].(string); ok && name == "cloudinitdisk" {
+					volumes = append(volumes, v)
+					break
+				}
+			}
+		}
+
+		devices["disks"] = existingDisks
+		vmSpecSpec["volumes"] = volumes
+		desired[resource.Name(vmKeyName)] = vm
+	}
+
+	if err := response.SetDesiredComposedResources(rsp, desired); err != nil {
+		response.Fatal(rsp, fmt.Errorf("setting desired composed resources: %w", err))
+		return rsp, nil
+	}
+
+	// Update XR status with root disk PVC name
+	statusDisks := []any{rootPVCName}
+	status, _ := xr.Resource.UnstructuredContent()["status"].(map[string]any)
+	if status == nil {
+		status = map[string]any{}
+	}
+	status["dataDisks"] = statusDisks
+	xr.Resource.SetUnstructuredContent(xr.Resource.UnstructuredContent())
+
+	if err := response.SetDesiredCompositeResource(rsp, xr); err != nil {
+		response.Fatal(rsp, fmt.Errorf("setting desired composite resource: %w", err))
+		return rsp, nil
+	}
+
+	response.ConditionTrue(rsp, "DataDisksReconciled", "Reconciled root disk")
 	return rsp, nil
 }
 

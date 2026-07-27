@@ -59,9 +59,71 @@ User Claim (ExternalVM)
 | `composition.yaml` | Composition with pipeline mode. Patches: XR spec -> VM/NAD fields, NAD name -> VM network ref, VM/NAD status -> XR status. Pipeline steps: data-disk-fn + ip-inject-fn. |
 | `infoblox-wapi.yaml` | Infoblox WAPI credentials (K8s Secret), CA cert (ConfigMap), and ClusterSecretStore for ExternalSecrets (legacy/optional). |
 | `claim.yaml` | Example claim — 4 CPU, 8Gi RAM, 40Gi disk, 2 data disks (data: 50Gi, logs: 20Gi). |
-| `functions/ip-inject-fn/` | Pipeline function: calls Infoblox WAPI for IP allocation + DNS, injects static network config into cloud-init. |
 | `functions/data-disk-fn/` | Pipeline function: creates PVCs for data disks, patches VM disks/volumes. |
+| `functions/ip-inject-fn/` | Pipeline function: calls Infoblox WAPI for IP allocation + DNS, injects static network config into cloud-init. |
 | `.gitignore` | Git ignore rules. |
+
+## Pipeline Functions
+
+### data-disk-fn
+
+Creates PVCs for each entry in `spec.dataDisks[]` and patches the VM with disk/volume entries.
+
+**Directory structure:**
+- `fn.go` — Function logic
+- `fn_test.go` — Unit tests
+- `render_test.go` — Composition render tests (run with `-claim-file=claim.yaml`)
+- `main.go` — Entry point
+- `Dockerfile` — Multi-stage BuildKit build
+- `package/crossplane.yaml` — xpkg function package manifest
+- `example/` — Example manifests for local `crossplane render` testing
+- `.github/workflows/ci.yml` — CI pipeline (lint, test, build, push)
+- `.golangci.yml` — Linter configuration
+- `.xpkgignore` — Excludes non-package files from xpkg build
+
+**Building:**
+```bash
+cd functions/data-disk-fn
+
+# Run tests
+go test ./... -v
+
+# Build xpkg package
+crossplane xpkg build -f package
+
+# Run render test against a claim
+go test -run TestRenderClaim -v -claim-file=../../claim.yaml
+```
+
+### ip-inject-fn
+
+Allocates a static IP from Infoblox NIOS via WAPI and injects it into the VM's cloud-init `userData`.
+
+**Directory structure:**
+- `fn.go` — Function logic
+- `fn_test.go` — Unit tests
+- `render_test.go` — Composition render tests (run with `-claim-file=claim.yaml`)
+- `main.go` — Entry point
+- `Dockerfile` — Multi-stage BuildKit build
+- `package/crossplane.yaml` — xpkg function package manifest
+- `example/` — Example manifests for local `crossplane render` testing
+- `.github/workflows/ci.yml` — CI pipeline (lint, test, build, push)
+- `.golangci.yml` — Linter configuration
+- `.xpkgignore` — Excludes non-package files from xpkg build
+
+**Building:**
+```bash
+cd functions/ip-inject-fn
+
+# Run tests
+go test ./... -v
+
+# Build xpkg package
+crossplane xpkg build -f package
+
+# Run render test against a claim
+go test -run TestRenderClaim -v -claim-file=../../claim.yaml
+```
 
 ## How It Works
 
@@ -83,7 +145,7 @@ Composition creates a NAD via `CombineFromCompositeFieldPath` — rebuilds the C
 ### 3. VirtualMachine (KubeVirt)
 
 Composition creates a KubeVirt VM with:
-- `containerDisk` from `spec.image` (patched from XR)
+- `persistentVolumeClaim` root disk from `spec.diskSize` (created by data-disk-fn)
 - `metadata.name` from `spec.vmName`, `metadata.namespace` from `spec.namespace`
 - CPU cores from `spec.cpu`, memory from `spec.memory`
 - Multus network reference patched from NAD name (`FromComposedFieldPath`)
@@ -148,7 +210,6 @@ kubectl get externalvm my-external-vm              # 7. Verify
 | namespace | `spec.namespace` | `metadata.namespace` |
 | cpu | `spec.cpu` | `spec.template.spec.domain.cpu.cores` |
 | memory | `spec.memory` | `spec.template.spec.domain.resources.requests.memory` |
-| image | `spec.image` | `spec.template.spec.volumes[0].containerDisk.image` |
 
 ### XR spec -> NAD
 | Patch | XR Field | NAD Field |
@@ -167,23 +228,6 @@ kubectl get externalvm my-external-vm              # 7. Verify
 | NAD name | NAD `metadata.name` | `status.nadName` |
 | VM uid | VM `metadata.uid` | `status.vmUID` |
 | VM conditions | VM `status.conditions` | `status.conditions` |
-
-## Pipeline Functions
-
-### data-disk-fn
-- Creates PVCs for each entry in `spec.dataDisks[]`
-- Patches VM's `spec.template.spec.domain.devices.disks` array
-- Patches VM's `spec.template.spec.volumes` array
-
-### ip-inject-fn
-- Reads Infoblox credentials from K8s Secret (`infoblox-credentials`)
-- Calls Infoblox WAPI:
-  - `POST /wapi/v2.12/ipv4address` — allocates static IP
-  - `POST /wapi/v2.12/record:host` — creates DNS A record
-- Reuses previously allocated IP on re-reconciliation (stored in XR status)
-- Injects cloud-init network-config v2 with static IP into VM's `cloudInitNoCloud.userData`
-- Sets `status.externalIP` and `status.infobloxIPRef` on XR
-- DNS creation failure is non-fatal (IP is still allocated)
 
 ## Infoblox Configuration
 
@@ -213,6 +257,4 @@ stringData:
 ## Known Gaps / TODOs
 
 - **IP release on VM deletion** — `status.infobloxIPRef` is stored but no finalizer releases the IP back to Infoblox when the VM is deleted. Add a finalizer + release logic.
-- **diskSize not propagated** — `spec.diskSize` has no target in KubeVirt's `containerDisk` (size is image-determined).
 - **networkView not required** — `spec.networkView` is optional; if omitted, Infoblox uses the default network view.
-- **No tests** — No unit tests, integration tests, or composition validation.

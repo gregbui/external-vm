@@ -64,8 +64,8 @@ spec:
                     pod: {}
               volumes:
                 - name: rootdisk
-                  containerDisk:
-                    image: quay.io/example/rhel9:latest
+                  persistentVolumeClaim:
+                    claimName: ""
                 - name: cloudinitdisk
                   cloudInitNoCloud:
                     userData: |
@@ -105,13 +105,6 @@ spec:
       composedResources:
         - virtual-machine
 
-    # ── XR spec -> VM (disks) ──
-    - type: FromCompositeFieldPath
-      description: Propagate image to VM containerDisk image
-      from: spec.image
-      to: spec.template.spec.volumes[0].containerDisk.image
-      composedResources:
-        - virtual-machine
 
     # ── XR spec -> NAD (metadata) ──
     - type: FromCompositeFieldPath
