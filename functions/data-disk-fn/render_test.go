@@ -41,7 +41,6 @@ func TestRenderClaim(t *testing.T) {
 
 	vmName := getString(claimMap, "spec.vmName", "vm-external")
 	namespace := getString(claimMap, "spec.namespace", "default")
-	image := getString(claimMap, "spec.image", "quay.io/example/rhel9:latest")
 	networkName := getString(claimMap, "spec.networkName", "external-web-net")
 
 	vmMap := map[string]any{
@@ -79,7 +78,7 @@ func TestRenderClaim(t *testing.T) {
 						},
 					},
 					"volumes": []any{
-						map[string]any{"name": "rootdisk", "containerDisk": map[string]any{"image": image}},
+						map[string]any{"name": "rootdisk", "persistentVolumeClaim": map[string]any{"claimName": ""}},
 						map[string]any{"name": "cloudinitdisk", "cloudInitNoCloud": map[string]any{"userData": "#cloud-config\nhostname: " + vmName + "\n"}},
 					},
 				},

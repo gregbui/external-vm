@@ -105,6 +105,19 @@ spec:
       composedResources:
         - virtual-machine
 
+    # ── XR spec -> VM (os type) ──
+    - type: FromCompositeFieldPath
+      description: Propagate osType to KubeVirt domain os.type
+      from: spec.osType
+      to: spec.template.spec.domain.os.type
+      transform:
+        type: string
+        string:
+          type: GoTemplate
+          goTemplate:
+            template: '{{ if eq .input "windows" }}windows.hyperv{{ else }}{{ .input }}{{ end }}' 
+      composedResources:
+        - virtual-machine
 
     # ── XR spec -> NAD (metadata) ──
     - type: FromCompositeFieldPath

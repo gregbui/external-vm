@@ -58,6 +58,14 @@ spec:
                 namespace:
                   type: string
                   default: "default"
+                # ── OS Type ──
+                # linux or windows. Affects disk bus type and network config injection.
+                osType:
+                  type: string
+                  default: "linux"
+                  enum:
+                    - linux
+                    - windows
                 # ── Data Disks ──
                 # Additional PVC-backed disks appended to the VM on top of the
                 # base OS disk (rootdisk). Variable length — specify 1 to N.
@@ -102,6 +110,10 @@ spec:
                   type: string
                 vmUID:
                   type: string
+                # ── OS Type Status
+                osType:
+                  type: string
+                  description: The OS type of the VM (linux or windows).
                 # ── Data Disk Status ──
                 # PVC names for each provisioned data disk, in order.
                 dataDisks:
