@@ -1,0 +1,18 @@
+apiVersion: myorg.io/v1alpha1
+kind: ExternalVM
+metadata:
+  name: example-vm
+  labels:
+    myorg.io/external-vm: "true"
+spec:
+  vmName: example-vm
+  cpu: 2
+  memory: 4Gi
+  diskSize: 20Gi
+  image: quay.io/example/rhel9:latest
+  namespace: default
+  networkName: external-net
+  bridgeName: br-ex
+  subnet: 10.20.30.0/24
+  gateway: 10.20.30.1
+  externalIPPool: production-external-ips

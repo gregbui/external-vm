@@ -1,0 +1,13 @@
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: ip-inject-fn
+spec:
+  compositeTypeRef:
+    apiVersion: myorg.io/v1alpha1
+    kind: ExternalVM
+  mode: Pipeline
+  pipeline:
+    - step: ip-inject
+      functionRef:
+        name: ip-inject-fn

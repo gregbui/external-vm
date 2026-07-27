@@ -21,34 +21,34 @@ User Claim (ExternalVM)
         │
         ▼
 ┌─── Composition (Pipeline Mode) ──────────────────────┐
-│                                                       │
-│  composedResources:                                   │
-│    1. NetworkAttachmentDefinition ──► Multus bridge   │
+│                                                      │
+│  composedResources:                                  │
+│    1. NetworkAttachmentDefinition ──► Multus bridge  │
 │    2. VirtualMachine        ──► KubeVirt VM          │
-│                                                       │
-│  patches:                                             │
-│    FromCompositeFieldPath: XR spec -> VM/NAD fields   │
-│    CombineFromCompositeFieldPath: rebuild NAD config  │
-│    FromComposedFieldPath:   NAD name -> VM network    │
-│    ToCompositeFieldPath:    VM/NAD status -> XR       │
-│                                                       │
-│  pipeline:                                            │
+│                                                      │
+│  patches:                                            │
+│    FromCompositeFieldPath: XR spec -> VM/NAD fields  │
+│    CombineFromCompositeFieldPath: rebuild NAD config │
+│    FromComposedFieldPath:   NAD name -> VM network   │
+│    ToCompositeFieldPath:    VM/NAD status -> XR      │
+│                                                      │
+│  pipeline:                                           │
 │    1. data-disk-reconciler ──► data-disk-fn          │
-│       (creates PVCs, patches VM disks/volumes)        │
+│       (creates PVCs, patches VM disks/volumes)       │
 │    2. ip-inject ──► ip-inject-fn                     │
-│       (calls Infoblox WAPI, injects static IP)        │
-└───────────────────────────────────────────────────────┘
+│       (calls Infoblox WAPI, injects static IP)       │
+└──────────────────────────────────────────────────────┘
         │
         ▼
 ┌─── Infoblox WAPI ────────────────────────────────────┐
 │  ip-inject-fn ──► POST /wapi/v2.12/ipv4address       │
-│       │                                               │
-│       ▼                                               │
+│       │                                              │
+│       ▼                                              │
 │  POST /wapi/v2.12/record:host (DNS)                  │
-│       │                                               │
-│       ▼                                               │
+│       │                                              │
+│       ▼                                              │
 │  cloud-init network-config v2 ──► VM guest OS        │
-└───────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────┘
 ```
 
 ## Files

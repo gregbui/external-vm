@@ -1,0 +1,13 @@
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: data-disk-fn
+spec:
+  compositeTypeRef:
+    apiVersion: myorg.io/v1alpha1
+    kind: ExternalVM
+  mode: Pipeline
+  pipeline:
+    - step: data-disk-reconciler
+      functionRef:
+        name: data-disk-fn

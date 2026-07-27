@@ -1,0 +1,10 @@
+# Ignore non-package files that crossplane xpkg build would try to parse
+.github/
+.golangci.yml
+NOTES.txt
+LICENSE
+example/
+render_test.go
+fn_test.go
+function.yaml
+function-deployment.yaml

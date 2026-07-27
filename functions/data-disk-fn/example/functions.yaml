@@ -1,0 +1,9 @@
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Function
+metadata:
+  name: data-disk-fn
+  annotations:
+    render.crossplane.io/runtime: Development
+spec:
+  package: data-disk-fn
