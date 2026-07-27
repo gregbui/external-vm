@@ -41,8 +41,8 @@ func TestRenderClaim(t *testing.T) {
 
 	vmName := getString(claimMap, "spec.vmName", "vm-external")
 	namespace := getString(claimMap, "spec.namespace", "default")
-	image := getString(claimMap, "spec.image", "quay.io/example/rhel9:latest")
 	networkName := getString(claimMap, "spec.networkName", "external-web-net")
+	_ = getString(claimMap, "spec.osType", "linux")
 		
 	vmMap := map[string]any{
 		"apiVersion": "kubevirt.io/v1",
@@ -79,7 +79,7 @@ func TestRenderClaim(t *testing.T) {
 						},
 					},
 					"volumes": []any{
-						map[string]any{"name": "rootdisk", "containerDisk": map[string]any{"image": image}},
+						map[string]any{"name": "rootdisk", "persistentVolumeClaim": map[string]any{"claimName": ""}},
 						map[string]any{"name": "cloudinitdisk", "cloudInitNoCloud": map[string]any{"userData": "#cloud-config\nhostname: " + vmName + "\n"}},
 					},
 				},
@@ -158,7 +158,7 @@ func TestRenderClaim(t *testing.T) {
 		}
 	}
 
-	// Print cloud-init userData for verification
+	// Print cloud-init userData (Linux) or SysPrep PVC (Windows) for verification
 	if vm, ok := desired.GetResources()["virtual-machine"]; ok {
 		obj := vm.GetResource()
 		if obj != nil {
@@ -170,12 +170,22 @@ func TestRenderClaim(t *testing.T) {
 			for _, v := range volumes {
 				vMap := v.(map[string]any)
 				if vMap["name"] == "cloudinitdisk" {
-					cloudInit := vMap["cloudInitNoCloud"].(map[string]any)
-					userData := cloudInit["userData"].(string)
-					fmt.Println("\n=== CLOUD-INIT USERDATA ===")
-					fmt.Println(userData)
+					if cloudInit, ok := vMap["cloudInitNoCloud"].(map[string]any); ok {
+						if userData, ok := cloudInit["userData"].(string); ok {
+							fmt.Println("\n=== CLOUD-INIT USERDATA ===")
+							fmt.Println(userData)
+						}
+					}
+				}
+				if vMap["name"] == "sysprepiso" {
+					fmt.Println("\n=== SYSPREP ISO VOLUME ===")
+					fmt.Printf("  PVC: %v\n", vMap["persistentVolumeClaim"])
 				}
 			}
+			// Print os type
+			domain := vmSpecSpec["domain"].(map[string]any)
+			osTypeField := domain["os"]
+			fmt.Printf("\n=== VM OS TYPE ===%s\n", osTypeField)
 		}
 	}
 }

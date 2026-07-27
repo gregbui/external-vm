@@ -59,10 +59,22 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 		return rsp, nil
 	}
 
+	// ── Extract osType ──
+	osType, _ := spec["osType"].(string)
+	if osType == "" {
+		osType = "linux"
+	}
+
 	// ── Extract diskSize for root disk ──
 	var rootDiskSize string
 	if ds, ok := spec["diskSize"].(string); ok && ds != "" {
 		rootDiskSize = ds
+	}
+
+	// ── Determine disk bus based on osType ──
+	rootDiskBus := "virtio"
+	if osType == "windows" {
+		rootDiskBus = "scsi"
 	}
 
 	// ── Extract dataDisks from XR spec ──
@@ -74,7 +86,7 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 			return rsp, nil
 		}
 		// Only root disk PVC needed
-		return f.createRootDiskPVC(rsp, desired, xr, rootDiskSize)
+		return f.createRootDiskPVC(rsp, desired, xr, rootDiskSize, osType, rootDiskBus)
 	}
 
 	// Parse disk specs
@@ -145,6 +157,45 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 		desired[rootPVCKeyName] = pvc
 	}
 
+	// ── Create PVCs for data disks ──
+	for i, ds := range desiredDisks {
+		pvcName := fmt.Sprintf("%s-%s", xr.Resource.GetName(), ds.name)
+		pvcKeyName := resource.Name(fmt.Sprintf("data-disk-%d", i))
+
+		pvc := resource.NewDesiredComposed()
+		pvc.Resource.SetAPIVersion("v1")
+		pvc.Resource.SetKind("PersistentVolumeClaim")
+		pvc.Resource.SetName(pvcName)
+		pvc.Resource.SetNamespace(xr.Resource.GetNamespace())
+		pvc.Resource.SetLabels(map[string]string{
+			pvcLabelManaged: "true",
+		})
+		pvc.Resource.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion:         xr.Resource.GetAPIVersion(),
+				Kind:               xr.Resource.GetKind(),
+				Name:               xr.Resource.GetName(),
+				UID:                xr.Resource.GetUID(),
+				Controller:         boolPtr(true),
+				BlockOwnerDeletion: boolPtr(true),
+			},
+		})
+
+		pvcSpec := map[string]any{
+			"accessModes": []any{"ReadWriteOnce"},
+			"resources": map[string]any{
+				"requests": map[string]any{
+					"storage": ds.size,
+				},
+			},
+		}
+		if ds.storageClassName != "" {
+			pvcSpec["storageClassName"] = ds.storageClassName
+		}
+		pvc.Resource.Object["spec"] = pvcSpec
+		desired[pvcKeyName] = pvc
+	}
+
 	// ── Patch VM: replace volumes array, add disk/volume entries ──
 	vm, ok := desired[resource.Name(vmKeyName)]
 	if !ok {
@@ -159,16 +210,23 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 	template := vmSpec["template"].(map[string]any)
 	vmSpecSpec := template["spec"].(map[string]any)
 	domain := vmSpecSpec["domain"].(map[string]any)
+	devices := domain["devices"].(map[string]any)
+
+	// ── Add SCSI controller for Windows ──
+	if osType == "windows" {
+		addSCSIController(devices)
+	}
 
 	// Get existing disks (rootdisk, cloudinitdisk) under domain.devices.disks
-	devices := domain["devices"].(map[string]any)
 	existingDisks, _ := devices["disks"].([]any)
 	if existingDisks == nil {
 		existingDisks = []any{}
 	}
 
-	// Build new volumes array: rootdisk (PVC ref) + cloudinitdisk + data disks
-	volumes := []any{}
+	// Build new volumes array.
+	// If root disk PVC exists, replace rootdisk volume with PVC ref and keep cloudinitdisk.
+	// Otherwise preserve existing volumes (rootdisk, cloudinitdisk, etc.) as-is.
+	var volumes []any
 	if rootPVCName != "" {
 		volumes = append(volumes, map[string]any{
 			"name": "rootdisk",
@@ -176,22 +234,24 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 				"claimName": rootPVCName,
 			},
 		})
-	}
-	// Find and add cloudinitdisk volume from existing volumes
-	existingVolumes, _ := vmSpecSpec["volumes"].([]any)
-	for _, v := range existingVolumes {
-		if vm, ok := v.(map[string]any); ok {
-			if name, ok := vm["name"].(string); ok && name == "cloudinitdisk" {
-				volumes = append(volumes, v)
-				break
+		existingVolumes, _ := vmSpecSpec["volumes"].([]any)
+		for _, v := range existingVolumes {
+			if vMap, ok := v.(map[string]any); ok {
+				if name, ok := vMap["name"].(string); ok && name == "cloudinitdisk" {
+					volumes = append(volumes, v)
+					break
+				}
 			}
 		}
+	} else {
+		existingVolumes, _ := vmSpecSpec["volumes"].([]any)
+		volumes = append(volumes, existingVolumes...)
 	}
 
 	// Append data disk entries to both disks and volumes arrays
 	for _, ds := range desiredDisks {
 		pvcName := fmt.Sprintf("%s-%s", xr.Resource.GetName(), ds.name)
-		// Disk entry
+		// Disk entry (data disks always use virtio)
 		existingDisks = append(existingDisks, map[string]any{
 			"name": ds.name,
 			"disk": map[string]any{
@@ -205,6 +265,21 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 				"claimName": pvcName,
 			},
 		})
+	}
+
+	// Update rootdisk entry with correct bus type
+	for i, d := range existingDisks {
+		if dMap, ok := d.(map[string]any); ok {
+			if name, ok := dMap["name"].(string); ok && name == "rootdisk" {
+				if dMap["disk"] != nil {
+					if diskMap, ok := dMap["disk"].(map[string]any); ok {
+						diskMap["bus"] = rootDiskBus
+					}
+				}
+				existingDisks[i] = dMap
+				break
+			}
+		}
 	}
 
 	devices["disks"] = existingDisks
@@ -231,6 +306,7 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 		status = map[string]any{}
 	}
 	status["dataDisks"] = statusDisks
+	status["osType"] = osType
 	xr.Resource.SetUnstructuredContent(xr.Resource.UnstructuredContent())
 
 	if err := response.SetDesiredCompositeResource(rsp, xr); err != nil {
@@ -239,12 +315,24 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 	}
 
 	response.ConditionTrue(rsp, "DataDisksReconciled",
-		fmt.Sprintf("Reconciled root disk + %d data disks", len(desiredDisks)))
+		fmt.Sprintf("Reconciled root disk (%s) + %d data disks [os=%s]", rootDiskBus, len(desiredDisks), osType))
 	return rsp, nil
 }
 
+// addSCSIController adds a virtio-scsi controller to the VM devices.
+func addSCSIController(devices map[string]any) {
+	controllers := []any{
+		map[string]any{
+			"name":   "scsi0",
+			"model":  "virtio-scsi",
+			"serial": "",
+		},
+	}
+	devices["controllers"] = controllers
+}
+
 // createRootDiskPVC handles the case where only a root disk PVC is needed (no data disks).
-func (f *Function) createRootDiskPVC(rsp *fnv1.RunFunctionResponse, desired map[resource.Name]*resource.Desired, xr *resource.Composite, rootDiskSize string) (*fnv1.RunFunctionResponse, error) {
+func (f *Function) createRootDiskPVC(rsp *fnv1.RunFunctionResponse, desired map[resource.Name]*resource.DesiredComposed, xr *resource.Composite, rootDiskSize string, osType string, rootDiskBus string) (*fnv1.RunFunctionResponse, error) {
 	rootPVCName := fmt.Sprintf("%s-rootdisk", xr.Resource.GetName())
 	rootPVCKeyName := resource.Name("root-disk-pvc")
 
@@ -286,10 +374,31 @@ func (f *Function) createRootDiskPVC(rsp *fnv1.RunFunctionResponse, desired map[
 		vmSpecSpec := template["spec"].(map[string]any)
 		domain := vmSpecSpec["domain"].(map[string]any)
 		devices := domain["devices"].(map[string]any)
+
+		// Add SCSI controller for Windows
+		if osType == "windows" {
+			addSCSIController(devices)
+		}
+
+		// Get existing disks and update rootdisk bus
 		existingDisks, _ := devices["disks"].([]any)
 		if existingDisks == nil {
 			existingDisks = []any{}
 		}
+		for i, d := range existingDisks {
+			if dMap, ok := d.(map[string]any); ok {
+				if name, ok := dMap["name"].(string); ok && name == "rootdisk" {
+					if dMap["disk"] != nil {
+						if diskMap, ok := dMap["disk"].(map[string]any); ok {
+							diskMap["bus"] = rootDiskBus
+						}
+					}
+					existingDisks[i] = dMap
+					break
+				}
+			}
+		}
+		devices["disks"] = existingDisks
 
 		volumes := []any{
 			map[string]any{
@@ -302,15 +411,14 @@ func (f *Function) createRootDiskPVC(rsp *fnv1.RunFunctionResponse, desired map[
 		// Find cloudinitdisk volume from existing
 		existingVolumes, _ := vmSpecSpec["volumes"].([]any)
 		for _, v := range existingVolumes {
-			if vm, ok := v.(map[string]any); ok {
-				if name, ok := vm["name"].(string); ok && name == "cloudinitdisk" {
+			if vMap, ok := v.(map[string]any); ok {
+				if name, ok := vMap["name"].(string); ok && name == "cloudinitdisk" {
 					volumes = append(volumes, v)
 					break
 				}
 			}
 		}
 
-		devices["disks"] = existingDisks
 		vmSpecSpec["volumes"] = volumes
 		desired[resource.Name(vmKeyName)] = vm
 	}
@@ -320,13 +428,14 @@ func (f *Function) createRootDiskPVC(rsp *fnv1.RunFunctionResponse, desired map[
 		return rsp, nil
 	}
 
-	// Update XR status with root disk PVC name
+	// Update XR status with root disk PVC name and osType
 	statusDisks := []any{rootPVCName}
 	status, _ := xr.Resource.UnstructuredContent()["status"].(map[string]any)
 	if status == nil {
 		status = map[string]any{}
 	}
 	status["dataDisks"] = statusDisks
+	status["osType"] = osType
 	xr.Resource.SetUnstructuredContent(xr.Resource.UnstructuredContent())
 
 	if err := response.SetDesiredCompositeResource(rsp, xr); err != nil {
@@ -334,7 +443,7 @@ func (f *Function) createRootDiskPVC(rsp *fnv1.RunFunctionResponse, desired map[
 		return rsp, nil
 	}
 
-	response.ConditionTrue(rsp, "DataDisksReconciled", "Reconciled root disk")
+	response.ConditionTrue(rsp, "DataDisksReconciled", fmt.Sprintf("Reconciled root disk (%s) [os=%s]", rootDiskBus, osType))
 	return rsp, nil
 }
 

@@ -260,6 +260,9 @@ func TestRunFunction(t *testing.T) {
 				f.testAllocateIP = func(ctx context.Context, vmName, subnet, networkView, ipPool string) (string, string, error) {
 					return "10.20.30.100", "infoblox://10.20.30.100", nil
 				}
+				f.testCreateDNSRecord = func(ctx context.Context, hostname, ip, subnet, networkView, ipPool string) error {
+					return nil
+				}
 			}
 			rsp, err := f.RunFunction(context.Background(), tc.req)
 
@@ -315,13 +318,13 @@ func TestRunFunction(t *testing.T) {
 			if tc.want.ipInUserData != "" && !strings.Contains(userData, tc.want.ipInUserData) {
 				t.Errorf("userData should contain IP %q, got: %s", tc.want.ipInUserData, userData)
 			}
-			if tc.want.dhcp4False && !strings.Contains(userData, "\"dhcp4\":false") {
+			if tc.want.dhcp4False && !strings.Contains(userData, "\"dhcp4\": false") {
 				t.Errorf("userData should have dhcp4: false, got: %s", userData)
 			}
 			if tc.want.gateway != "" && !strings.Contains(userData, tc.want.gateway) {
 				t.Errorf("userData should contain gateway %q, got: %s", tc.want.gateway, userData)
 			}
-			if tc.want.vmName != "" && !strings.Contains(userData, "hostname: "+tc.want.vmName) {
+			if tc.want.vmName != "" && !strings.Contains(userData, "\"hostname\": \""+tc.want.vmName+"\"") {
 				t.Errorf("userData should contain hostname %q, got: %s", tc.want.vmName, userData)
 			}
 

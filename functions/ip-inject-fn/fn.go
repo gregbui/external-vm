@@ -21,6 +21,12 @@ import (
 	"github.com/crossplane/function-sdk-go/request"
 	"github.com/crossplane/function-sdk-go/resource"
 	"github.com/crossplane/function-sdk-go/response"
+
+	"encoding/base64"
+
+	"github.com/diskfs/go-diskfs/backend/file"
+	"github.com/diskfs/go-diskfs/filesystem/iso9660"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -32,16 +38,21 @@ const (
 	defaultInfobloxPassKey    = "password"
 	defaultInfobloxCAPath     = "/certs/infoblox-ca.crt"
 	wapiVersion               = "v2.12"
+
+	// SysPrep ISO constants
+	sysprepISOSize       = 16 * 1024 * 1024 // 16 MiB
+	sysprepISOFileName   = "unattend.xml"
+	sysprepSecretNameFmt = "%s-sysprep-iso"
 )
 
 type ipAllocateReq struct {
-	ConfigureForDHCP bool              `json:"configureForDHCP"`
-	IPv4Address      string            `json:"ipv4address,omitempty"`
-	MAC              string            `json:"mac,omitempty"`
-	Name             string            `json:"name"`
-	Comment          string            `json:"comment,omitempty"`
-	NetworkView      string            `json:"network_view,omitempty"`
-	ExtAttrs         map[string]any    `json:"extattrs,omitempty"`
+	ConfigureForDHCP bool           `json:"configureForDHCP"`
+	IPv4Address      string         `json:"ipv4address,omitempty"`
+	MAC              string         `json:"mac,omitempty"`
+	Name             string         `json:"name"`
+	Comment          string         `json:"comment,omitempty"`
+	NetworkView      string         `json:"network_view,omitempty"`
+	ExtAttrs         map[string]any `json:"extattrs,omitempty"`
 }
 
 type ipAllocateResp struct {
@@ -50,11 +61,11 @@ type ipAllocateResp struct {
 }
 
 type dnsHostReq struct {
-	Name        string            `json:"name"`
-	IPv4Address string            `json:"ipv4address"`
-	Comment     string            `json:"comment,omitempty"`
-	NetworkView string            `json:"network_view,omitempty"`
-	ExtAttrs    map[string]any    `json:"extattrs,omitempty"`
+	Name        string         `json:"name"`
+	IPv4Address string         `json:"ipv4address"`
+	Comment     string         `json:"comment,omitempty"`
+	NetworkView string         `json:"network_view,omitempty"`
+	ExtAttrs    map[string]any `json:"extattrs,omitempty"`
 }
 
 type Function struct {
@@ -70,6 +81,8 @@ type Function struct {
 
 	// testAllocateIP is an optional override for testing.
 	testAllocateIP func(ctx context.Context, vmName, subnet, networkView, ipPool string) (ip string, ref string, err error)
+	// testCreateDNSRecord is an optional override for testing.
+	testCreateDNSRecord func(ctx context.Context, hostname, ip, subnet, networkView, ipPool string) error
 }
 
 func (f *Function) initHTTPClient() error {
@@ -146,6 +159,12 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 	networkView, _ := spec["networkView"].(string)
 	ipPool, _ := spec["externalIPPool"].(string)
 
+	// ── Extract osType ──
+	osType, _ := spec["osType"].(string)
+	if osType == "" {
+		osType = "linux"
+	}
+
 	subnetPrefix := "/24"
 	for i := len(subnet) - 1; i >= 0; i-- {
 		if subnet[i] == '/' {
@@ -170,43 +189,83 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 		}
 	}
 
-	if f.testAllocateIP == nil {
-		if err := f.createDNSRecord(ctx, vmName, ipStr, subnet, networkView, ipPool); err != nil {
-			f.log.Info("DNS record creation failed (non-fatal)", "vm", vmName, "err", err.Error())
+	// Create DNS record
+	hostname := fmt.Sprintf("%s.%s", vmName, subnet[:len(subnet)-len(subnetPrefix)+1])
+	if err := f.createDNSRecord(ctx, hostname, ipStr, subnet, networkView, ipPool); err != nil {
+		f.log.Info("Failed to create DNS record", "error", err)
+		// Non-fatal — IP is still allocated
+	}
+
+	// ── Inject network config based on osType ──
+	if osType == "windows" {
+		if err := f.injectSysPrep(ctx, desired, xr, vmName, ipStr, subnet, subnetPrefix, gateway); err != nil {
+			response.ConditionFalse(rsp, "IPInjected", fmt.Sprintf("Failed to inject SysPrep config: %v", err))
+			return rsp, nil
+		}
+	} else {
+		// Linux: existing cloud-init behavior
+		userData := f.buildCloudInitUserData(vmName, ipStr, subnet, subnetPrefix, gateway)
+		if err := f.injectCloudInitConfig(vm, userData); err != nil {
+			response.ConditionFalse(rsp, "IPInjected", fmt.Sprintf("Failed to inject cloud-init config: %v", err))
+			return rsp, nil
 		}
 	}
 
-	networkConfig := map[string]any{
-		"version": 2,
-		"ethernets": map[string]any{
-			"eth1": map[string]any{
-				"dhcp4": false,
-				"addresses": []any{
-					fmt.Sprintf("%s%s", ipStr, subnetPrefix),
-				},
-				"nameservers": map[string]any{
-					"addresses": []any{"8.8.8.8", "1.1.1.1"},
-				},
-				"routes": []any{
-					map[string]any{
-						"to":     "0.0.0.0/0",
-						"via":    gateway,
-						"metric": 100,
-					},
-				},
-			},
-		},
-	}
+	desired[resource.Name(vmKeyName)] = vm
 
-	networkConfigJSON, err := json.Marshal(networkConfig)
-	if err != nil {
-		response.Fatal(rsp, fmt.Errorf("marshaling network config: %w", err))
+	status, _ = xrContent["status"].(map[string]any)
+	if status == nil {
+		status = map[string]any{}
+	}
+	status["externalIP"] = ipStr
+	status["infobloxIPRef"] = ipRefStr
+	status["osType"] = osType
+	xr.Resource.SetUnstructuredContent(xrContent)
+
+	if err := response.SetDesiredComposedResources(rsp, desired); err != nil {
+		response.Fatal(rsp, fmt.Errorf("setting desired composed resources: %w", err))
+		return rsp, nil
+	}
+	if err := response.SetDesiredCompositeResource(rsp, xr); err != nil {
+		response.Fatal(rsp, fmt.Errorf("setting desired composite resource: %w", err))
 		return rsp, nil
 	}
 
-	userData := fmt.Sprintf("#cloud-config\nhostname: %s\nmanage_etc_hosts: true\nnetwork:\n  config: %s\n",
-		vmName, string(networkConfigJSON))
+	response.ConditionTrue(rsp, "IPInjected", fmt.Sprintf("Injected IP %s [os=%s]", ipStr, osType))
+	return rsp, nil
+}
 
+// ── Linux: cloud-init ──
+
+func (f *Function) buildCloudInitUserData(vmName, ip, subnet, subnetPrefix, gateway string) string {
+	networkConfig := map[string]any{
+		"network": map[string]any{
+			"config": []any{
+				map[string]any{
+					"type":        "physical",
+					"name":        "eth1",
+					"subnets":     []any{map[string]any{"address": ip + subnetPrefix, "dns_nameservers": []any{"8.8.8.8", "1.1.1.1"}, "routes": []any{map[string]any{"to": "0.0.0.0/0", "via": gateway, "metric": 100}}}},
+					"dhcp4":       false,
+					"dhcp6":       false,
+					"mac_address": "",
+				},
+			},
+		},
+		"hostname":   vmName,
+		"fqdn":       fmt.Sprintf("%s.local", vmName),
+		"users":      []any{map[string]any{"name": "root", "ssh_authorized_keys": []any{}}},
+		"ssh_pwauth": true,
+	}
+
+	networkConfigJSON, err := json.MarshalIndent(networkConfig, "", "  ")
+	if err != nil {
+		return fmt.Sprintf("#cloud-config\nhostname: %s\n", vmName)
+	}
+
+	return fmt.Sprintf("#cloud-config\n%s", string(networkConfigJSON))
+}
+
+func (f *Function) injectCloudInitConfig(vm *resource.DesiredComposed, userData string) error {
 	vmSpec := vm.Resource.UnstructuredContent()["spec"].(map[string]any)
 	template := vmSpec["template"].(map[string]any)
 	templateSpec := template["spec"].(map[string]any)
@@ -228,27 +287,209 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 		}
 	}
 
-	desired[resource.Name(vmKeyName)] = vm
+	return nil
+}
 
-	status, _ = xrContent["status"].(map[string]any)
-	if status == nil {
-		status = map[string]any{}
-	}
-	status["externalIP"] = ipStr
-	status["infobloxIPRef"] = ipRefStr
-	xr.Resource.SetUnstructuredContent(xrContent)
+// ── Windows: SysPrep ──
 
-	if err := response.SetDesiredComposedResources(rsp, desired); err != nil {
-		response.Fatal(rsp, fmt.Errorf("setting desired composed resources: %w", err))
-		return rsp, nil
-	}
-	if err := response.SetDesiredCompositeResource(rsp, xr); err != nil {
-		response.Fatal(rsp, fmt.Errorf("setting desired composite resource: %w", err))
-		return rsp, nil
+func (f *Function) injectSysPrep(ctx context.Context, desired map[resource.Name]*resource.DesiredComposed, xr *resource.Composite, vmName, ip, subnet, subnetPrefix, gateway string) error {
+	// Generate unattend.xml
+	unattendXML, err := f.generateUnattendXML(vmName, ip, subnet, subnetPrefix, gateway)
+	if err != nil {
+		return fmt.Errorf("generating unattend.xml: %w", err)
 	}
 
-	response.ConditionTrue(rsp, "IPInjected", fmt.Sprintf("Injected IP %s", ipStr))
-	return rsp, nil
+	// Create ISO with unattend.xml
+	isoBytes, err := f.createSysPrepISO(unattendXML)
+	if err != nil {
+		return fmt.Errorf("creating SysPrep ISO: %w", err)
+	}
+
+	// Create Secret with ISO
+	namespace := xr.Resource.GetNamespace()
+	isoSecretName := fmt.Sprintf(sysprepSecretNameFmt, vmName)
+
+	isoSecret := resource.NewDesiredComposed()
+	isoSecret.Resource.SetAPIVersion("v1")
+	isoSecret.Resource.SetKind("Secret")
+	isoSecret.Resource.SetName(isoSecretName)
+	isoSecret.Resource.SetNamespace(namespace)
+	isoSecret.Resource.SetLabels(map[string]string{
+		"external-vm-fn": "true",
+	})
+	isoSecret.Resource.SetOwnerReferences([]metav1.OwnerReference{
+		{
+			APIVersion:         xr.Resource.GetAPIVersion(),
+			Kind:               xr.Resource.GetKind(),
+			Name:               xr.Resource.GetName(),
+			UID:                xr.Resource.GetUID(),
+			Controller:         boolPtr(true),
+			BlockOwnerDeletion: boolPtr(true),
+		},
+	})
+
+	isoSecret.Resource.Object["data"] = map[string]any{
+		"sysprep.iso": base64.StdEncoding.EncodeToString(isoBytes),
+	}
+	isoSecret.Resource.Object["type"] = "Opaque"
+
+	desired[resource.Name("sysprep-iso")] = isoSecret
+
+	// Patch VM: add ISO disk and volume
+	vm, ok := desired[resource.Name(vmKeyName)]
+	if !ok {
+		return fmt.Errorf("VM not found in desired resources")
+	}
+	vmSpec := vm.Resource.UnstructuredContent()["spec"].(map[string]any)
+	template := vmSpec["template"].(map[string]any)
+	templateSpec := template["spec"].(map[string]any)
+	volumes, _ := templateSpec["volumes"].([]any)
+
+	// Add sysprep ISO volume
+	volumes = append(volumes, map[string]any{
+		"name": "sysprepiso",
+		"disk": map[string]any{
+			"image": fmt.Sprintf("docker://localhost/%s/%s:latest", namespace, isoSecretName),
+		},
+	})
+
+	// Find cloudinitdisk and add sysprepiso after it
+	newVolumes := []any{}
+	for _, v := range volumes {
+		newVolumes = append(newVolumes, v)
+		if vMap, ok := v.(map[string]any); ok {
+			if name, ok := vMap["name"].(string); ok && name == "cloudinitdisk" {
+				// Insert sysprep ISO volume after cloudinitdisk
+				newVolumes = append(newVolumes, volumes[len(volumes)-1])
+				volumes = newVolumes
+				break
+			}
+		}
+	}
+
+	templateSpec["volumes"] = volumes
+
+	// Add sysprep disk to devices
+	domain := templateSpec["domain"].(map[string]any)
+	devices := domain["devices"].(map[string]any)
+	disks, _ := devices["disks"].([]any)
+	if disks == nil {
+		disks = []any{}
+	}
+	disks = append(disks, map[string]any{
+		"name": "sysprepiso",
+		"disk": map[string]any{
+			"bus": "sata",
+		},
+	})
+	devices["disks"] = disks
+
+	return nil
+}
+
+// generateUnattendXML creates a SysPrep unattend.xml with network configuration.
+func (f *Function) generateUnattendXML(vmName, ip, subnet, subnetPrefix, gateway string) (string, error) {
+	unattend := fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-TCPIP" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <Interfaces>
+        <Interface id="eth1">
+          <Ipv4Addresses>
+            <IpAddress id="0" wcm:action="add" wcm:keyValue="1">%s%s</IpAddress>
+          </Ipv4Addresses>
+          <Routes>
+            <Route id="0" wcm:action="add" wcm:keyValue="1">
+              <Identifier>0</Identifier>
+              <Prefix>0.0.0.0/0</Prefix>
+              <NextHopAddress>%s</NextHopAddress>
+            </Route>
+          </Routes>
+          <EnableDHCP>false</EnableDHCP>
+        </Interface>
+      </Interfaces>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <ComputerName>%s</ComputerName>
+      <ProductKey></ProductKey>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>Administrator</Name>
+            <Password>
+              <Value>Pa$$w0rd123!</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <ProtectYourPC>1</ProtectYourPC>
+        <SkipUserOOBE>true</SkipUserOOBE>
+        <SkipMachineOOBE>false</SkipMachineOOBE>
+      </OOBE>
+    </component>
+  </settings>
+</unattend>`, ip, subnetPrefix, gateway, vmName)
+
+	return unattend, nil
+}
+
+// createSysPrepISO creates an ISO9660 filesystem containing the unattend.xml file.
+func (f *Function) createSysPrepISO(unattendXML string) ([]byte, error) {
+	blocksize := int64(2048)
+	size := int64(sysprepISOSize)
+
+	// Create a temp file for the ISO
+	tmpFile, err := os.CreateTemp("", "sysprep-*.iso")
+	if err != nil {
+		return nil, fmt.Errorf("creating temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	// Create backend from file
+	b := file.New(tmpFile, false)
+
+	// Create ISO9660 filesystem
+	fs, err := iso9660.Create(b, size, 2048*blocksize, blocksize, "")
+	if err != nil {
+		return nil, fmt.Errorf("creating ISO9660 filesystem: %w", err)
+	}
+
+	// Write unattend.xml to the root of the ISO
+	isofile, err := fs.OpenFile(sysprepISOFileName, os.O_CREATE|os.O_RDWR)
+	if err != nil {
+		return nil, fmt.Errorf("creating unattend.xml in ISO: %w", err)
+	}
+	if _, err := isofile.Write([]byte(unattendXML)); err != nil {
+		isofile.Close()
+		return nil, fmt.Errorf("writing unattend.xml to ISO: %w", err)
+	}
+	isofile.Close()
+
+	// Finalize with Rock Ridge extensions
+	err = fs.Finalize(iso9660.FinalizeOptions{
+		RockRidge:        true,
+		VolumeIdentifier: "SYSPREP",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("finalizing ISO: %w", err)
+	}
+
+	// Read ISO bytes from temp file
+	tmpFile.Seek(0, 0)
+	isoBytes, err := io.ReadAll(tmpFile)
+	if err != nil {
+		return nil, fmt.Errorf("reading ISO from temp file: %w", err)
+	}
+
+	return isoBytes, nil
 }
 
 func (f *Function) readInfobloxCreds(ctx context.Context) (map[string]string, error) {
@@ -320,6 +561,9 @@ func (f *Function) allocateIP(ctx context.Context, vmName, subnet, networkView, 
 }
 
 func (f *Function) createDNSRecord(ctx context.Context, hostname, ip, subnet, networkView, ipPool string) error {
+	if f.testCreateDNSRecord != nil {
+		return f.testCreateDNSRecord(ctx, hostname, ip, subnet, networkView, ipPool)
+	}
 	reqBody := dnsHostReq{
 		Name:        hostname,
 		IPv4Address: ip,
@@ -363,3 +607,5 @@ func (f *Function) createDNSRecord(ctx context.Context, hostname, ip, subnet, ne
 	}
 	return nil
 }
+
+func boolPtr(b bool) *bool { return &b }
